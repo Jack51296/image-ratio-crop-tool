@@ -136,7 +136,7 @@
     <header>
       <div>
         <h1>图像比例裁剪</h1>
-        <p class="subtitle">自动匹配最接近的标准比例，只裁剪，不缩放</p>
+        <p class="subtitle">自动匹配最接近的标准比例，默认只裁剪不缩放；超过 3000×3000 的图片会先把最长边缩到 3000 以内</p>
       </div>
       <div class="local-tag">图片仅在本机处理</div>
     </header>
@@ -164,6 +164,7 @@
             <div class="info"><span>文件大小</span><strong id="fileSize">—</strong></div>
             <div class="info"><span>格式</span><strong id="fileType">—</strong></div>
           </div>
+          <p class="note" id="scaleNote" hidden></p>
         </section>
 
         <section class="section">
@@ -191,7 +192,7 @@
               <option value="image/webp">WebP</option>
             </select>
           </label>
-          <p class="note">输出尺寸等于裁剪区域尺寸，不进行重采样。JPEG / WebP 会由浏览器重新编码；如需尽量保留像素值，建议导出 PNG。</p>
+          <p class="note">输出尺寸等于裁剪区域尺寸，不再二次缩放。若原图最长边超过 3000，会先缩小再裁剪。JPEG / WebP 会由浏览器重新编码；如需尽量保留像素值，建议导出 PNG。</p>
         </section>
 
         <div class="actions">
@@ -210,6 +211,7 @@
       [3,4], [4,3], [3,2], [2,3], [5,4],
       [4,5], [21,9], [9,21]
     ];
+    const MAX_LONG_EDGE = 3000;
 
     const $ = (id) => document.getElementById(id);
     const els = {
@@ -217,10 +219,18 @@
       browse: $('browseButton'), replace: $('replaceButton'), download: $('downloadButton'),
       ratios: $('ratioList'), sourceSize: $('sourceSize'), sourceRatio: $('sourceRatio'),
       fileSize: $('fileSize'), fileType: $('fileType'), cropSize: $('cropSize'),
-      retention: $('retention'), autoBadge: $('autoBadge'), format: $('formatSelect'), error: $('errorText')
+      retention: $('retention'), autoBadge: $('autoBadge'), format: $('formatSelect'),
+      error: $('errorText'), scaleNote: $('scaleNote')
     };
     const ctx = els.canvas.getContext('2d');
-    const state = { file: null, image: null, ratio: null, crop: null, focusX: .5, focusY: .5, url: null };
+    const state = {
+      file: null, image: null, ratio: null, crop: null,
+      focusX: .5, focusY: .5, url: null,
+      originalWidth: 0, originalHeight: 0, scaled: false
+    };
+
+    function sourceWidth(image) { return image.naturalWidth || image.width; }
+    function sourceHeight(image) { return image.naturalHeight || image.height; }
 
     for (const [w, h] of RATIOS) {
       const button = document.createElement('button');
@@ -263,8 +273,8 @@
       const dx = event.clientX - pointer.x;
       const dy = event.clientY - pointer.y;
       const rect = els.canvas.getBoundingClientRect();
-      const overflowX = Math.max(0, state.image.naturalWidth - state.crop.width);
-      const overflowY = Math.max(0, state.image.naturalHeight - state.crop.height);
+      const overflowX = Math.max(0, sourceWidth(state.image) - state.crop.width);
+      const overflowY = Math.max(0, sourceHeight(state.image) - state.crop.height);
       if (overflowX) state.focusX = clamp(pointer.focusX - dx / rect.width * state.crop.width / overflowX, 0, 1);
       if (overflowY) state.focusY = clamp(pointer.focusY - dy / rect.height * state.crop.height / overflowY, 0, 1);
       updateCropPosition();
@@ -303,6 +313,61 @@
       }, { ratio: RATIOS[0], distance: Infinity }).ratio;
     }
 
+    function fitWithinMaxEdge(width, height, maxEdge = MAX_LONG_EDGE) {
+      const longEdge = Math.max(width, height);
+      if (longEdge <= maxEdge) return { width, height, scaled: false };
+      const scale = maxEdge / longEdge;
+      let nextWidth = Math.max(1, Math.round(width * scale));
+      let nextHeight = Math.max(1, Math.round(height * scale));
+      if (Math.max(nextWidth, nextHeight) > maxEdge) {
+        nextWidth = Math.max(1, Math.floor(width * scale));
+        nextHeight = Math.max(1, Math.floor(height * scale));
+      }
+      return { width: nextWidth, height: nextHeight, scaled: true };
+    }
+
+    function downscaleImage(image, width, height) {
+      let src = image;
+      let currentWidth = sourceWidth(image);
+      let currentHeight = sourceHeight(image);
+
+      while (currentWidth / 2 >= width && currentHeight / 2 >= height) {
+        currentWidth = Math.max(width, Math.round(currentWidth / 2));
+        currentHeight = Math.max(height, Math.round(currentHeight / 2));
+        const step = document.createElement('canvas');
+        step.width = currentWidth;
+        step.height = currentHeight;
+        const stepCtx = step.getContext('2d');
+        stepCtx.imageSmoothingEnabled = true;
+        stepCtx.imageSmoothingQuality = 'high';
+        stepCtx.drawImage(src, 0, 0, currentWidth, currentHeight);
+        src = step;
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const outputCtx = canvas.getContext('2d');
+      outputCtx.imageSmoothingEnabled = true;
+      outputCtx.imageSmoothingQuality = 'high';
+      outputCtx.drawImage(src, 0, 0, width, height);
+      return canvas;
+    }
+
+    function applySourceInfo() {
+      const width = sourceWidth(state.image);
+      const height = sourceHeight(state.image);
+      els.sourceSize.textContent = `${width} × ${height}`;
+      els.sourceRatio.textContent = simplifiedRatio(width, height);
+      if (state.scaled) {
+        els.scaleNote.hidden = false;
+        els.scaleNote.textContent = `原图 ${state.originalWidth} × ${state.originalHeight}，已缩小到最长边 ${MAX_LONG_EDGE} 以内`;
+      } else {
+        els.scaleNote.hidden = true;
+        els.scaleNote.textContent = '';
+      }
+    }
+
     async function loadFile(file) {
       showError();
       if (!file.type.startsWith('image/')) return showError('请选择图像文件。');
@@ -310,19 +375,29 @@
       state.url = URL.createObjectURL(file);
       const image = new Image();
       image.onload = () => {
-        state.file = file;
-        state.image = image;
-        state.focusX = .5;
-        state.focusY = .5;
-        els.sourceSize.textContent = `${image.naturalWidth} × ${image.naturalHeight}`;
-        els.sourceRatio.textContent = simplifiedRatio(image.naturalWidth, image.naturalHeight);
-        els.fileSize.textContent = formatBytes(file.size);
-        els.fileType.textContent = (file.type.split('/')[1] || '未知').toUpperCase();
-        els.dropzone.classList.add('has-image');
-        els.replace.disabled = false;
-        els.download.disabled = false;
-        const ratio = nearestRatio(image.naturalWidth, image.naturalHeight);
-        chooseRatio(ratio[0], ratio[1], true);
+        try {
+          const originalWidth = image.naturalWidth;
+          const originalHeight = image.naturalHeight;
+          const fitted = fitWithinMaxEdge(originalWidth, originalHeight);
+          const working = fitted.scaled ? downscaleImage(image, fitted.width, fitted.height) : image;
+          state.file = file;
+          state.image = working;
+          state.originalWidth = originalWidth;
+          state.originalHeight = originalHeight;
+          state.scaled = fitted.scaled;
+          state.focusX = .5;
+          state.focusY = .5;
+          els.fileSize.textContent = formatBytes(file.size);
+          els.fileType.textContent = (file.type.split('/')[1] || '未知').toUpperCase();
+          els.dropzone.classList.add('has-image');
+          els.replace.disabled = false;
+          els.download.disabled = false;
+          applySourceInfo();
+          const ratio = nearestRatio(sourceWidth(working), sourceHeight(working));
+          chooseRatio(ratio[0], ratio[1], true);
+        } catch (error) {
+          showError('无法处理这张超大图片，请先缩小后再试。');
+        }
       };
       image.onerror = () => showError('无法读取这张图片。HEIC 等格式可能需要先转换为 JPG、PNG 或 WebP。');
       image.src = state.url;
@@ -337,8 +412,8 @@
       if (!automatic) setTimeout(() => els.autoBadge.classList.remove('show'), 0);
       if (!state.image) return;
 
-      const iw = state.image.naturalWidth;
-      const ih = state.image.naturalHeight;
+      const iw = sourceWidth(state.image);
+      const ih = sourceHeight(state.image);
       const scale = Math.min(Math.floor(iw / w), Math.floor(ih / h));
       if (scale < 1) {
         state.crop = null;
@@ -358,8 +433,8 @@
 
     function updateCropPosition() {
       if (!state.crop || !state.image) return;
-      state.crop.x = Math.round((state.image.naturalWidth - state.crop.width) * state.focusX);
-      state.crop.y = Math.round((state.image.naturalHeight - state.crop.height) * state.focusY);
+      state.crop.x = Math.round((sourceWidth(state.image) - state.crop.width) * state.focusX);
+      state.crop.y = Math.round((sourceHeight(state.image) - state.crop.height) * state.focusY);
     }
 
     function renderPreview() {
